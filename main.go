@@ -39,16 +39,18 @@ func main() {
 
 	collection := client.Database(environment.DatabaseName).Collection("Instances")
 
+	handlers := handlers.NewHandlers(collection)
+
 	app := fiber.New()
 
 	app.Get("/", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"message": "OK"})
 	})
 
-	app.Get("/instance/:instanceID", handlers.GetInstance(collection))
-	app.Get("/all", handlers.FetchAllInstances(collection))
-	app.Post("/create", handlers.RegisterInstance(collection))
-	app.Use("/api/*", handlers.APIProxy(collection))
+	app.Get("/instance/:instanceID", handlers.Instance.GetInstance())
+	app.Get("/all", handlers.Instance.FetchAllInstances())
+	app.Post("/create", handlers.Instance.RegisterInstance())
+	app.Use("/api/*", handlers.Proxy.APIProxy())
 
 	listening_host := os.Getenv("LISTEN_HOST")
 	listening_port := os.Getenv("LISTEN_PORT")

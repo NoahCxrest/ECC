@@ -69,14 +69,21 @@ func AssignShardIdentifiers(collection mongo.Collection, instanceType string, to
 	for shard, document := 0, 0; float32(shard) <= floatedShardCount && document < len(results); document, shard = document+1, shard+shardsPerDocument {
 		shardsToCompleteTo := shard + shardsPerDocument - 1
 
-		var info types.InstanceInfo = results[document]
-
+		info := results[document]
 		var shardSlice []int
 		for i := shard; i <= shardsToCompleteTo && i <= totalShardCount; i++ {
 			shardSlice = append(shardSlice, i)
 		}
 
-		info.ShardIds = shardSlice
+		_, err := collection.UpdateOne(
+			context.TODO(),
+			bson.M{"instance_id": info.InstanceId},
+			bson.M{"$set": bson.M{"shard_ids": shardSlice}},
+		)
+		if err != nil {
+			return nil, err
+		}
+
 		documents[info.InstanceId] = shardSlice
 	}
 	return documents, nil

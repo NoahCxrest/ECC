@@ -18,6 +18,18 @@ import (
 	"main/types"
 )
 
+type Handlers struct {
+	Instance *InstanceHandler
+	Proxy    *ProxyHandler
+}
+
+func NewHandlers(collection *mongo.Collection) *Handlers {
+	return &Handlers{
+		Instance: NewInstanceHandler(collection),
+		Proxy:    NewProxyHandler(collection),
+	}
+}
+
 func RegisterInstance(collection *mongo.Collection) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		var requestBody types.PartialInstanceInfo
