@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -9,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/bytedance/sonic"
 	"github.com/caarlos0/env/v11"
 	"github.com/charmbracelet/log" // this is just to make things pretty
 	"github.com/gofiber/fiber/v2"
@@ -18,8 +20,13 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"hash"
+	"io/ioutil"
 	"math"
+	"net/http"
 	"os"
+	"slices"
+	"strconv"
+	"strings"
 )
 
 var instanceCollection *mongo.Collection
@@ -42,12 +49,45 @@ type InstanceInfo struct {
 	Protocol       string   `bson:"protocol"`
 }
 
+type GuildFetch struct {
+	Guild string `json:"guild"`
+}
+
+type GetMutualGuilds struct {
+	Guilds []MutualGuild `json:"guilds"`
+}
+
+type MutualGuild struct {
+	Name            string `json:"name"`
+	ID              string `json:"id"`
+	Icon            string `json:"icon_url"`
+	MemberCount     string `json:"member_count"`
+	PermissionLevel int    `json:"permission_level"`
+}
+
 type PartialInstanceInfo struct {
 	InstanceName string
 	InstanceType string
 	Token        string
 	Hostname     string
 	Protocol     string
+}
+
+func UnmarshalHandler(data []byte) (interface{}, error) {
+	var getMutualGuilds GetMutualGuilds
+	err := sonic.Unmarshal(data, &getMutualGuilds)
+
+	if err == nil && len(getMutualGuilds.Guilds) > 0 {
+		return getMutualGuilds, nil
+	}
+
+	var mutualGuilds []MutualGuild
+	err = sonic.Unmarshal(data, &mutualGuilds)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal data into supported types: %v", err)
+	}
+
+	return mutualGuilds, nil
 }
 
 func initClient(mongoURL string) (*mongo.Client, error) {
@@ -130,6 +170,34 @@ func deleteAllInstances(collection mongo.Collection) error {
 
 func fetchInstanceByInstanceName(collection mongo.Collection, instanceName string) (*InstanceInfo, error) {
 	result := collection.FindOne(context.TODO(), bson.D{{"instance_name", instanceName}})
+	if result == nil {
+		return nil, nil
+	}
+
+	var instance InstanceInfo
+
+	if err := result.Decode(&instance); err != nil {
+		return nil, nil
+	}
+	return &instance, nil
+}
+
+func fetchInstanceByGuild(collection mongo.Collection, guildID string) (*InstanceInfo, error) {
+	result := collection.FindOne(context.TODO(), bson.D{{"guild_ids", guildID}})
+	if result == nil {
+		return nil, nil
+	}
+
+	var instance InstanceInfo
+
+	if err := result.Decode(&instance); err != nil {
+		return nil, nil
+	}
+	return &instance, nil
+}
+
+func fetchInstanceByShard(collection mongo.Collection, shardID int) (*InstanceInfo, error) {
+	result := collection.FindOne(context.TODO(), bson.D{{"shard_ids", shardID}})
 	if result == nil {
 		return nil, nil
 	}
@@ -273,6 +341,47 @@ func getInstance(fiberContext *fiber.Ctx) error {
 	return fiberContext.JSON(instance)
 }
 
+func shardCalculator(guild_id int64, total_shard_count int) int {
+	return (int(guild_id) >> 22) % total_shard_count
+}
+
+func sendRequestToTargets(c *fiber.Ctx, targets []string) ([]interface{}, error) {
+	var bodies []interface{}
+
+	for _, target := range targets {
+
+		request, _ := http.NewRequest(c.Method(), target, bytes.NewBuffer(c.Body()))
+		origHeaders := c.GetReqHeaders()
+		// set request headers to be orig_headers
+
+		for key, values := range origHeaders {
+			for _, value := range values {
+				request.Header.Add(key, value)
+			}
+		}
+
+		resp, err := http.DefaultClient.Do(request)
+		if err != nil {
+			return nil, c.Status(http.StatusInternalServerError).SendString(err.Error())
+		}
+
+		defer resp.Body.Close()
+
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return nil, c.Status(http.StatusInternalServerError).SendString(err.Error())
+		}
+
+		newData, err := UnmarshalHandler(body)
+		log.Info("sendRequestToTargets", "body", body, "err", err)
+		if err != nil {
+			log.Fatal(err)
+		}
+		bodies = append(bodies, newData)
+	}
+	return bodies, nil
+}
+
 func main() {
 
 	log.Info("Starting database connection ...")
@@ -307,7 +416,7 @@ func main() {
 			SHA256Hash:     make([]byte, 1),
 			ShardIds:       []int{},
 			Protocol:       "HTTPS",
-			Hostname:       "localhost",
+			Hostname:       os.Getenv("PRODUCTION_TEST_HOSTNAME"),
 		})
 		log.Info("Created instance ", "id", i)
 	}
@@ -334,6 +443,146 @@ func main() {
 	app.Get("/instance/:instanceID", getInstance)
 	app.Get("/all", fetchAllInstances)
 	app.Post("/create", registerInstance)
+
+	app.Use("/api/*", func(c *fiber.Ctx) error {
+		path := c.Path()
+
+		if strings.Contains(path, "get_mutual_guilds") || strings.Contains(path, "get_staff_guilds") {
+			// needs to hit all nodes, unfortunately.
+			results, err := instanceCollection.Find(context.TODO(), bson.D{})
+
+			if err != nil {
+				log.Error(err)
+			}
+
+			var resultArray []InstanceInfo
+
+			err = results.All(context.TODO(), &resultArray)
+			if err != nil {
+				return err
+			}
+
+			var targets []string = make([]string, 0, len(resultArray))
+
+			for _, result := range resultArray {
+				targets = append(targets, fmt.Sprintf("%s://%s%s", strings.ToLower(result.Protocol), result.Hostname, strings.Replace(path, "api/", "", 1)))
+			}
+
+			// make a request for every hostname
+
+			var bodies []interface{}
+
+			bodies, err = sendRequestToTargets(c, targets)
+			log.Warn(bodies)
+
+			if err != nil {
+				c.JSON(fiber.Map{"err": err})
+				return c.SendStatus(500)
+			}
+
+			var combined_body []MutualGuild
+
+			for _, body := range bodies {
+				t, ok := body.(GetMutualGuilds)
+				if !ok {
+					t, _ := body.([]MutualGuild)
+					log.Warn(t)
+					for _, guild := range t {
+						if !slices.Contains(combined_body, guild) {
+							combined_body = append(combined_body, guild)
+						}
+					}
+				} else {
+					for _, guild := range t.Guilds {
+						if !slices.Contains(combined_body, guild) {
+							combined_body = append(combined_body, guild)
+						}
+					}
+				}
+			}
+
+			var returnValue fiber.Map
+
+			if strings.Contains(path, "get_mutual_guilds") {
+				returnValue = fiber.Map{
+					"guilds": combined_body,
+				}
+			} else {
+				return c.JSON(combined_body)
+			}
+
+			return c.JSON(returnValue)
+		}
+
+		var guildObj GuildFetch
+
+		err := c.BodyParser(&guildObj)
+		if err != nil {
+			c.JSON(fiber.Map{
+				"error": err,
+			})
+			return c.SendStatus(500)
+		}
+
+		log.Info(guildObj.Guild)
+		if guildObj.Guild == "" {
+			c.JSON(fiber.Map{
+				"error": err,
+			})
+			return c.SendStatus(500)
+		}
+
+		instance, err := fetchInstanceByGuild(*instanceCollection, guildObj.Guild)
+		if instance == nil {
+			guildId, err := strconv.ParseInt(guildObj.Guild, 10, 64)
+			if err != nil {
+				c.JSON(fiber.Map{
+					"error": err,
+				})
+				return c.SendStatus(500)
+			}
+			shard := shardCalculator(guildId, 22)
+			log.Warn("shard", "id", shard)
+			instance, err = fetchInstanceByShard(*instanceCollection, shard)
+			log.Warn("instance", "instance", instance, "err", err)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		if instance == nil {
+			c.JSON(fiber.Map{"err": "no guild or shard found"})
+			return c.SendStatus(500)
+		}
+
+		targetURL := fmt.Sprintf("%s://%s%s", strings.ToLower(instance.Protocol), instance.Hostname, strings.Replace(path, "api/", "", 1))
+		log.Warn(targetURL)
+
+		request, _ := http.NewRequest(c.Method(), targetURL, bytes.NewBuffer(c.Body()))
+		origHeaders := c.GetReqHeaders()
+		// set request headers to be orig_headers
+
+		for key, values := range origHeaders {
+			for _, value := range values {
+				request.Header.Add(key, value)
+			}
+		}
+
+		resp, err := http.DefaultClient.Do(request)
+		if err != nil {
+			return c.Status(http.StatusInternalServerError).SendString(err.Error())
+		}
+
+		defer resp.Body.Close()
+
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return c.Status(http.StatusInternalServerError).SendString(err.Error())
+		}
+
+		c.Set("Content-Type", resp.Header.Get("Content-Type"))
+		return c.Send(body)
+	})
 
 	listening_host := os.Getenv("LISTEN_HOST")
 	listening_port := os.Getenv("LISTEN_PORT")
