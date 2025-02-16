@@ -1,8 +1,6 @@
 package handlers
 
 import (
-
-	// Changed from non-versioned bson
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
